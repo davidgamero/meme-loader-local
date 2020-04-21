@@ -1,7 +1,15 @@
 var AWS = require("aws-sdk");
 const fs = require('fs');
+const request = require('request');
+
+const sharp = require("sharp");
+
+const tf = require('@tensorflow/tfjs');
+const tfnode = require('@tensorflow/tfjs-node');
+const cocoSsd = require('@tensorflow-models/coco-ssd');
 
 const { getMemes10kFromLocal } = require("./localMemes");
+const { downloadRemoteMemes } = require("./remoteMemes");
 
 console.log(getMemes10kFromLocal)
 
@@ -31,56 +39,70 @@ let g10kRaw = fs.readFileSync('google-10000-english-usa.txt', 'utf-8', (err) => 
 GOOGLE10K = g10kRaw.toString().split('\n');
 console.log('Loaded Google10k wordlist');
 
+MEMES = getMemes10kFromLocal();
 
-loadMemes();
-//phaseUpdateTest();
+let num_samples = 1000;
+let memes_sample = MEMES.slice(1, num_samples + 1);
 
-async function phaseUpdateTest() {
-  let result = await pullMemes(PHASE_1, 100);
-  let memes = result.Items;
-  console.log(memes);
+console.log(memes_sample);
 
-  await Promise.all(memes.map((m) => setMemePhase(m, PHASE_2)));
-}
 
-async function loadMemes() {
+var download = function (uri, filename, callback) {
+  return new Promise(function (resolve, reject) {
+    request.head(uri, function (err, res, body) {
+      //console.log('content-type:', res.headers['content-type']);
+      //console.log('content-length:', res.headers['content-length']);
 
-  //let newMemesData = await pullAllMemes(PHASE_1);
-  //fs.writeFile('memedump.json', newMemesData, 'utf8', () => console.log('done'));
-  let raw = fs.readFileSync('memedump_10k.json', 'utf8');
-  let newMemes = JSON.parse(raw);
-
-  console.log('Queried ' + newMemes.length + ' memes with phase ' + PHASE_1);
-
-  let noTextCount = 0;
-  let filterFail10k = [];
-
-  let newMemes_10k = newMemes.filter(e => {
-    if (!e.text) {
-      noTextCount++;
-      return false;
-    };
-
-    e.text = e.text.toLowerCase();
-
-    let meme_text = e.text.split(' ');
-    for (i = 0; i < meme_text.length; i++) {
-      if (GOOGLE10K.includes(meme_text[i])) {
-        return true;
-      }
-    };
-    filterFail10k.push(e.text);
-    return false;
+      request(uri).pipe(fs.createWriteStream(filename)).on('close', resolve);
+    });
   })
+};
+let localImageDir = 'img';
 
-  //fs.writeFile('memedump_10k.json', JSON.stringify(newMemes_10k), 'utf8', () => console.log('wrote 10k json file'));
+let num_downloaded = 0;
+// memes_sample.forEach(async function (meme) {
+//   let localPath = `${localImageDir}/${meme.name}.${meme.extension}`;
+//   await download(meme.url, localPath);
+//   num_downloaded += 1;
 
-  newMemes_10k;
-  console.log(`Kept ${newMemes_10k.length} memes after 10k filtering`);
+//   console.log(`Downloading ${num_samples} samples ${100 * num_downloaded / num_samples}%`);
+// });
 
-  //searchWord('poop', MEMES);
-  return newMemes_10k;
+async function fileToTensor(filename) {
+  const { data, info } = await sharp(filename)
+    .removeAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  return imageToTensor(data, info);
 }
+
+const imageToTensor = (pixelData, imageInfo) => {
+  const outShape = [1, imageInfo.height, imageInfo.width, imageInfo.channels];
+
+  return tf.tidy(() =>
+    tf
+      .tensor4d(pixelData, outShape, "int32")
+      .toFloat()
+      .resizeBilinear([224, 224])
+      .div(tf.scalar(127))
+      .sub(tf.scalar(1))
+  );
+};
+
+async function recognize() {
+  const modelCoco = await cocoSsd.load();
+
+  let meme = memes_sample[0];
+  const imageBuffer = fs.readFileSync(`${localImageDir}/${meme.name}.${meme.extension}`);
+  const tfimage = tfnode.node.decodeImage(imageBuffer);
+  let predictions = await modelCoco.detect(tfimage);
+  console.log(predictions);
+  return 1
+}
+
+recognize().catch(function (e) { console.log(e) })
+
 
 
 function searchWord(searchWord, MEMES) {
@@ -96,103 +118,4 @@ function searchWord(searchWord, MEMES) {
     return false;
   })
   console.log(`Found ${hits.length} matches for '${searchWord}'`);
-}
-
-
-async function pullAllMemes(phase, lastEvalKey) {
-  let params = {
-    TableName: TABLE_NAME,
-    IndexName: "phase-date-index",
-    ExpressionAttributeValues: {
-      ":phase0": phase,
-    },
-    KeyConditionExpression: 'phase = :phase0',
-    Limit: MEMES_PER_PULL,
-  };
-
-
-  let allMemes = [];
-  let continuePulling = true;
-
-  while (continuePulling) {
-    let p = ddb.query(params).promise();
-
-    let result = await p;
-
-    allMemes = allMemes.concat(result.Items);
-
-    console.log(`${result.LastEvaluatedKey ? 'LastEvaluatedKey: ' + result.LastEvaluatedKey.date + ' ' : ''} ${'MemesQueried: ' + allMemes.length}`);
-
-    if (!result.LastEvaluatedKey) {
-      continuePulling = false;
-    } else {
-      params.ExclusiveStartKey = result.LastEvaluatedKey;
-    }
-  }
-
-  return allMemes;
-};
-
-function pullMemes(phase, limit) {
-  return new Promise((resolve, reject) => {
-    let pullLimit = limit;
-    let params = {
-      TableName: TABLE_NAME,
-      IndexName: "phase-date-index",
-      // ExpressionAttributeNames: {
-      //   "#n": "name",
-      // },
-      ExpressionAttributeValues: {
-        ":phase0": phase,
-      },
-      KeyConditionExpression: 'phase = :phase0',
-      Limit: pullLimit,
-    };
-
-    console.log('Running query');
-
-    let p = ddb.query(params, function (err, data) {
-      if (err) {
-        console.log("Error", err);
-        reject(err);
-      } else {
-        //console.log("Success", data);
-        // data.Items.map(function (element) {
-        //   console.log(element);
-        // });
-        resolve(data);
-      }
-    });
-  });
-}
-
-/**
- * Update meme phase field in DynamoDB
- * @param {*} targetMeme 
- * @param {*} text 
- */
-async function setMemePhase(targetMeme, phase) {
-  let params = {
-    TableName: TABLE_NAME,
-    Key: {
-      name: targetMeme.name,
-      date: targetMeme.date
-    },
-    UpdateExpression: 'set #p = :p,lastPhaseUpdate = :lastPhaseUpdate',
-    ExpressionAttributeValues: {
-      ':p': phase,
-      ':lastPhaseUpdate': Date.now(),
-    },
-    ExpressionAttributeNames: {
-      '#p': 'phase',
-    },
-    ReturnValues: 'ALL_NEW',
-  };
-
-  console.log(params);
-
-  let response = await ddb.update(params).promise();
-
-  console.log('Updated phase for ' + targetMeme.name + ' to ' + phase);
-  return response;
 }
